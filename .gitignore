@@ -1,0 +1,14 @@
+# python env / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# datasets
+data/
+*.zip
+*.pdf
+
+# training artifacts
+models/
+outputs/
