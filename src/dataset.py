@@ -16,6 +16,7 @@ ASSET_TYPES: tuple[str, ...] = (
     "vari-grip",
     "yoke-suspension",
 )
+ASSET_TO_IDX: dict[str, int] = {asset: idx for idx, asset in enumerate(ASSET_TYPES)}
 
 # good → 0 (normal), bad → 1 (defective)
 LABEL_GOOD: int = 0
@@ -43,7 +44,7 @@ def scan_train_dir(root: Path) -> list[Sample]:
     return samples
 
 
-class InsPLADDataset(Dataset[tuple[Tensor, int]]):
+class InsPLADDataset(Dataset[tuple[Tensor, int, int]]):
     """Binary defect-classification dataset for InsPLAD."""
 
     def __init__(
@@ -57,13 +58,13 @@ class InsPLADDataset(Dataset[tuple[Tensor, int]]):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, int]:
+    def __getitem__(self, idx: int) -> tuple[Tensor, int, int]:
         sample = self.samples[idx]
         with Image.open(sample.path) as img:
             img = img.convert("RGB")
         if self.transform is None:
             raise RuntimeError("transform is required")
-        return self.transform(img), sample.label
+        return self.transform(img), sample.label, ASSET_TO_IDX[sample.asset_type]
 
 
 class TestImageDataset(Dataset[tuple[Tensor, str]]):

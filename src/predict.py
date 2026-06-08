@@ -8,9 +8,27 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import TestImageDataset
+from dataset import ASSET_TYPES, TestImageDataset
 from model import load_checkpoint
 from transforms import build_eval_transform
+
+
+def get_csv_encoding(path: Path) -> str:
+    raw_head = path.read_bytes()[:3]
+    return "utf-8-sig" if raw_head == b"\xef\xbb\xbf" else "utf-8"
+
+
+def get_threshold_for_asset(
+    bundle: dict[str, object],
+    asset_type: str,
+    threshold_override: float | None,
+) -> float:
+    if threshold_override is not None:
+        return threshold_override
+    raw_thresholds = bundle.get("asset_thresholds", {})
+    if isinstance(raw_thresholds, dict) and asset_type in raw_thresholds:
+        return float(raw_thresholds[asset_type])
+    return float(bundle["threshold"])
 
 
 def predict(
@@ -22,46 +40,71 @@ def predict(
     batch_size: int = 64,
     num_workers: int = 6,
 ) -> None:
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[predict] device={device}")
 
     model, bundle = load_checkpoint(str(model_path), device)
-    img_size: int = int(bundle["img_size"])
-    threshold: float = (
-        threshold_override if threshold_override is not None else float(bundle["threshold"])
+    img_size = int(bundle["img_size"])
+    global_threshold = float(
+        threshold_override if threshold_override is not None else bundle["threshold"]
     )
-    print(f"[predict] backbone={bundle['backbone']} img_size={img_size} threshold={threshold:.4f}")
+    print(
+        f"[predict] backbone={bundle['backbone']} img_size={img_size} "
+        f"fallback_threshold={global_threshold:.4f}"
+    )
 
     ds = TestImageDataset(image_dir, transform=build_eval_transform(img_size))
     loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
 
+    asset_types = tuple(str(asset) for asset in bundle.get("asset_types", ASSET_TYPES))
     fname_to_prob: dict[str, float] = {}
+    fname_to_asset_type: dict[str, str] = {}
+    fname_to_threshold: dict[str, float] = {}
     with torch.no_grad():
         for imgs, names in tqdm(loader, desc="predict"):
             imgs = imgs.to(device, non_blocking=True)
             with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
-                logits = model(imgs)
+                logits, asset_logits = model(imgs, return_asset_logits=True)
             probs = torch.sigmoid(logits.float()).cpu().numpy()
-            for name, prob in zip(names, probs):
-                fname_to_prob[name] = float(prob)
+            pred_asset_idxs = asset_logits.detach().float().argmax(dim=1).cpu().numpy()
+            for name, prob, pred_asset_idx in zip(names, probs, pred_asset_idxs):
+                filename = str(name)
+                asset_type = asset_types[int(pred_asset_idx)]
+                fname_to_prob[filename] = float(prob)
+                fname_to_asset_type[filename] = asset_type
+                fname_to_threshold[filename] = get_threshold_for_asset(
+                    bundle,
+                    asset_type,
+                    threshold_override,
+                )
 
-    # preserve a UTF-8 BOM if the template has one
-    raw_head: bytes = template_csv.read_bytes()[:3]
-    csv_encoding: str = "utf-8-sig" if raw_head == b"\xef\xbb\xbf" else "utf-8"
+    csv_encoding = get_csv_encoding(template_csv)
     template = pd.read_csv(template_csv, encoding=csv_encoding)
-    missing: list[str] = [f for f in template["filename"] if f not in fname_to_prob]
+    missing = [str(f) for f in template["filename"] if str(f) not in fname_to_prob]
     if missing:
         print(f"[predict] WARN: {len(missing)} files in template not found, e.g. {missing[:3]}")
 
+    template["pred_asset_type"] = template["filename"].map(
+        lambda f: fname_to_asset_type.get(str(f), "")
+    )
+    template["threshold_used"] = template["filename"].map(
+        lambda f: fname_to_threshold.get(str(f), global_threshold)
+    )
     template["pred_label"] = template["filename"].map(
-        lambda f: int(fname_to_prob.get(f, 0.0) >= threshold)
+        lambda f: int(
+            fname_to_prob.get(str(f), 0.0)
+            >= fname_to_threshold.get(str(f), global_threshold)
+        )
     )
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     template.to_csv(out_csv, index=False, encoding=csv_encoding)
-    pos: int = int(template["pred_label"].sum())
+    pos = int(template["pred_label"].sum())
     print(
         f"[predict] wrote {out_csv}  total={len(template)}  defective={pos}  "
         f"normal={len(template) - pos}"
