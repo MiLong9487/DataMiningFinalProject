@@ -14,8 +14,8 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from dataset import InsPLADDataset, Sample, scan_train_dir
-from metrics import find_threshold_for_precision
+from dataset import ASSET_TYPES, InsPLADDataset, Sample, scan_train_dir
+from metrics import BinaryMetrics, compute_metrics, find_threshold_for_precision
 from model import build_model
 from transforms import build_eval_transform, build_train_transform
 
@@ -42,6 +42,35 @@ def build_sampler(samples: list[Sample]) -> WeightedRandomSampler:
     counts: Counter[int] = Counter(s.label for s in samples)
     weights: list[float] = [1.0 / counts[s.label] for s in samples]
     return WeightedRandomSampler(weights, num_samples=len(samples), replacement=True)
+
+
+def compute_asset_metrics(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    asset_types: np.ndarray,
+    threshold: float,
+) -> dict[str, BinaryMetrics]:
+    metrics: dict[str, BinaryMetrics] = {}
+    for asset_type in ASSET_TYPES:
+        mask = asset_types == asset_type
+        if not mask.any():
+            continue
+        metrics[asset_type] = compute_metrics(probs[mask], labels[mask], threshold)
+    return metrics
+
+
+def print_asset_metrics(asset_metrics: dict[str, dict[str, object]]) -> None:
+    print("[train] best validation metrics by asset type:")
+    for asset_type in ASSET_TYPES:
+        metrics = asset_metrics.get(asset_type)
+        if metrics is None:
+            continue
+        print(
+            f"  {asset_type}: "
+            f"P={metrics['precision']:.4f} R={metrics['recall']:.4f} "
+            f"F1={metrics['f1']:.4f} acc={metrics['accuracy']:.4f} "
+            f"tp={metrics['tp']} fp={metrics['fp']} tn={metrics['tn']} fn={metrics['fn']}"
+        )
 
 
 def run_epoch(
@@ -121,6 +150,7 @@ def main() -> None:
 
     train_s, val_s = stratified_split(samples, args.val_ratio, args.seed)
     print(f"[train] train={len(train_s)} val={len(val_s)}")
+    val_asset_types = np.array([s.asset_type for s in val_s])
 
     train_ds = InsPLADDataset(train_s, transform=build_train_transform(args.img_size))
     val_ds = InsPLADDataset(val_s, transform=build_eval_transform(args.img_size))
@@ -156,11 +186,16 @@ def main() -> None:
         )
 
         if score > best_score:
+            asset_metrics = compute_asset_metrics(val_probs, val_labels, val_asset_types, thr)
             best_score = score
             best_meta = {
                 "epoch": epoch,
                 "threshold": thr,
                 "metrics": asdict(m),
+                "asset_metrics": {
+                    asset_type: asdict(metrics)
+                    for asset_type, metrics in asset_metrics.items()
+                },
                 "backbone": args.backbone,
                 "img_size": args.img_size,
                 "dropout": 0.2,
@@ -176,6 +211,7 @@ def main() -> None:
     if best_meta:
         m = best_meta["metrics"]
         print(f"[train] best metrics: {m}")
+        print_asset_metrics(best_meta["asset_metrics"])
 
 
 if __name__ == "__main__":
